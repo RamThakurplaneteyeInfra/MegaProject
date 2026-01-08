@@ -1,0 +1,23 @@
+fastapi
+uvicorn[standard]
+
+# Database
+sqlalchemy
+psycopg2-binary
+geoalchemy2
+
+# GIS / KML processing
+geopandas
+shapely
+fiona
+pyproj
+
+# Utilities
+python-dotenv
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+geoalchemy2
+lxml
+python-multipart
