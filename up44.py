@@ -3456,6 +3456,197 @@ async def ndvi_sugarcane_detection(
         raise
     except Exception as e:
         raise HTTPException(500, f"NDVI detection failed: {e}")
+@app.post("/land-surface-temperature")
+async def land_surface_temperature(
+    district: str = Query(...),
+    subdistrict: str | None = Query(None),
+    village: str | None = Query(None),
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    try:
+        # ==================================================
+        # 1) GEOMETRY SELECTION (UNCHANGED)
+        # ==================================================
+        geometry = None
+        response_geometry = None
+        plot_name = None
+
+        if district and not subdistrict and not village:
+            row = db.execute(
+                text("""
+                    SELECT district_name,
+                           ST_AsGeoJSON(geom)::json AS geometry
+                    FROM districts
+                    WHERE LOWER(district_name) = LOWER(:district)
+                    LIMIT 1
+                """),
+                {"district": district},
+            ).mappings().first()
+            if not row:
+                raise HTTPException(404, "District not found")
+
+            plot_name = row["district_name"]
+            geometry = ee.Geometry(row["geometry"])
+            response_geometry = row["geometry"]
+
+        elif district and subdistrict and not village:
+            row = db.execute(
+                text("""
+                    SELECT v.sub_dist,
+                           ST_AsGeoJSON(ST_Union(b.geom))::json AS geometry
+                    FROM village v
+                    JOIN village_boundaries b ON b.village_id = v.id
+                    WHERE LOWER(v.district) = LOWER(:district)
+                      AND LOWER(v.sub_dist) = LOWER(:subdistrict)
+                    GROUP BY v.sub_dist
+                """),
+                {"district": district, "subdistrict": subdistrict},
+            ).mappings().first()
+            if not row:
+                raise HTTPException(404, "Subdistrict not found")
+
+            plot_name = row["sub_dist"]
+            geometry = ee.Geometry(row["geometry"])
+            response_geometry = row["geometry"]
+
+        elif district and subdistrict and village:
+            row = db.execute(
+                text("""
+                    SELECT v.village_name,
+                           ST_AsGeoJSON(b.geom)::json AS geometry
+                    FROM village v
+                    JOIN village_boundaries b ON b.village_id = v.id
+                    WHERE LOWER(v.district) = LOWER(:district)
+                      AND LOWER(v.sub_dist) = LOWER(:subdistrict)
+                      AND LOWER(v.village_name) = LOWER(:village)
+                    LIMIT 1
+                """),
+                {"district": district, "subdistrict": subdistrict, "village": village},
+            ).mappings().first()
+            if not row:
+                raise HTTPException(404, "Village not found")
+
+            plot_name = row["village_name"]
+            geometry = ee.Geometry(row["geometry"])
+            response_geometry = row["geometry"]
+
+        else:
+            raise HTTPException(400, "Invalid input combination")
+
+        # ==================================================
+        # 2) LANDSAT LST COLLECTION (L8 + L9)
+        # ==================================================
+        def landsat_lst(collection_id):
+            return (
+                ee.ImageCollection(collection_id)
+                .filterDate(start_date, end_date)
+                .filterBounds(geometry)
+                .filter(ee.Filter.lt("CLOUD_COVER", 10))
+                .select("ST_B10")
+                .map(lambda img: (
+                    img.multiply(0.00341802)
+                       .add(149.0)
+                       .subtract(273.15)
+                       .rename("LST_C")
+                       .clip(geometry)
+                       .copyProperties(img, ["system:time_start"])
+                ))
+            )
+
+        lst_collection = (
+            landsat_lst("LANDSAT/LC08/C02/T1_L2")
+            .merge(landsat_lst("LANDSAT/LC09/C02/T1_L2"))
+        )
+
+        # ==================================================
+        # 3) LAST 12 MONTHS COMPOSITES
+        # ==================================================
+        end = ee.Date(end_date)
+        start = end.advance(-11, "month")
+
+        months = ee.List.sequence(0, 11).map(
+            lambda m: start.advance(m, "month")
+        )
+
+        def monthly_lst(date):
+            date = ee.Date(date)
+            col = lst_collection.filterDate(date, date.advance(1, "month"))
+
+            img = ee.Image(
+                ee.Algorithms.If(
+                    col.size().gt(0),
+                    col.mean(),
+                    ee.Image.constant(0).rename("LST_C").updateMask(ee.Image(0))
+                )
+            )
+
+            mean_val = img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=geometry,
+                scale=30,
+                maxPixels=1e13
+            ).get("LST_C")
+
+            return ee.Feature(None, {
+                "month": date.format("YYYY-MM"),
+                "mean_lst_c": mean_val
+            })
+
+        lst_timeseries_fc = ee.FeatureCollection(months.map(monthly_lst))
+
+        # ==================================================
+        # 4) TILE VISUALIZATION (MEAN OF 12 MONTHS)
+        # ==================================================
+        lst_mean = lst_collection.mean().clip(geometry)
+
+        lst_vis = {
+            "min": 20,
+            "max": 45,
+            "palette": ["0000FF", "00FFFF", "00FF00", "FFFF00", "FFA500", "FF0000"]
+        }
+
+        lst_viz = lst_mean.visualize(**lst_vis)
+
+        boundary = (
+            ee.Image()
+            .byte()
+            .paint(
+                featureCollection=ee.FeatureCollection([ee.Feature(geometry)]),
+                color=1,
+                width=2
+            )
+            .visualize(palette=["FFFFFF"])
+        )
+
+        final_viz = lst_viz.blend(boundary)
+        tile_url = final_viz.getMapId()["tile_fetcher"].url_format
+
+        # ==================================================
+        # 5) RESPONSE
+        # ==================================================
+        return {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": response_geometry,
+                "properties": {
+                    "plot_id": plot_name,
+                    "tile_url": tile_url,
+                    "data_source": "Landsat 8/9 C2 L2 – LST",
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "last_updated": datetime.now().isoformat(),
+                }
+            }],
+            "lst_monthly_timeseries": lst_timeseries_fc.getInfo()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"LST processing failed: {e}")
 
 @app.post("/methane-concentration")
 async def methane_concentration(
