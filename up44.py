@@ -2956,6 +2956,252 @@ async def boundary_to_kml(
             detail=f"KML generation failed: {str(e)}",
         )
 
+# @app.post("/ndvi-sugarcane-detection")
+# async def ndvi_sugarcane_detection(
+#     district: str = Query(...),
+#     subdistrict: str | None = Query(None),
+#     village: str | None = Query(None),
+#     start_date: str = Query(...),
+#     end_date: str = Query(...),
+#     ndvi_threshold: float = Query(0.6),
+#     db: Session = Depends(get_db),
+# ):
+#     try:
+#         # ==================================================
+#         # 1) GEOMETRY SELECTION (UNCHANGED)
+#         # ==================================================
+#         geometry = None
+#         response_geometry = None
+#         plot_name = None
+
+#         if district and not subdistrict and not village:
+#             row = db.execute(
+#                 text("""
+#                     SELECT district_name,
+#                            ST_AsGeoJSON(geom)::json AS geometry
+#                     FROM districts
+#                     WHERE LOWER(district_name) = LOWER(:district)
+#                     LIMIT 1
+#                 """),
+#                 {"district": district},
+#             ).mappings().first()
+#             if not row:
+#                 raise HTTPException(404, "District not found")
+
+#             plot_name = row["district_name"]
+#             geometry = ee.Geometry(row["geometry"])
+#             response_geometry = row["geometry"]
+
+#         elif district and subdistrict and not village:
+#             row = db.execute(
+#                 text("""
+#                     SELECT v.sub_dist,
+#                            ST_AsGeoJSON(ST_Union(b.geom))::json AS geometry
+#                     FROM village v
+#                     JOIN village_boundaries b ON b.village_id = v.id
+#                     WHERE LOWER(v.district) = LOWER(:district)
+#                       AND LOWER(v.sub_dist) = LOWER(:subdistrict)
+#                     GROUP BY v.sub_dist
+#                 """),
+#                 {"district": district, "subdistrict": subdistrict},
+#             ).mappings().first()
+#             if not row:
+#                 raise HTTPException(404, "Subdistrict not found")
+
+#             plot_name = row["sub_dist"]
+#             geometry = ee.Geometry(row["geometry"])
+#             response_geometry = row["geometry"]
+
+#         elif district and subdistrict and village:
+#             row = db.execute(
+#                 text("""
+#                     SELECT v.village_name,
+#                            ST_AsGeoJSON(b.geom)::json AS geometry
+#                     FROM village v
+#                     JOIN village_boundaries b ON b.village_id = v.id
+#                     WHERE LOWER(v.district) = LOWER(:district)
+#                       AND LOWER(v.sub_dist) = LOWER(:subdistrict)
+#                       AND LOWER(v.village_name) = LOWER(:village)
+#                     LIMIT 1
+#                 """),
+#                 {"district": district, "subdistrict": subdistrict, "village": village},
+#             ).mappings().first()
+#             if not row:
+#                 raise HTTPException(404, "Village not found")
+
+#             plot_name = row["village_name"]
+#             geometry = ee.Geometry(row["geometry"])
+#             response_geometry = row["geometry"]
+
+#         else:
+#             raise HTTPException(400, "Invalid input combination")
+
+#         # ==================================================
+#         # 2) NDVI COLLECTIONS
+#         # ==================================================
+#         def landsat_ndvi(collection_id):
+#             return (
+#                 ee.ImageCollection(collection_id)
+#                 .filterDate(start_date, end_date)
+#                 .filterBounds(geometry)
+#                 .map(lambda img: (
+#                     img.select("SR.*")
+#                     .multiply(ee.Number(img.get("REFLECTANCE_MULT_BAND_3")))
+#                     .add(ee.Number(img.get("REFLECTANCE_ADD_BAND_2")))
+#                     .normalizedDifference(["SR_B5", "SR_B4"])
+#                     .rename("ndvi")
+#                     .clip(geometry)
+#                     .copyProperties(img, ["system:time_start"])
+#                 ))
+#             )
+
+#         landsat8 = landsat_ndvi("LANDSAT/LC08/C02/T1_L2")
+#         landsat9 = landsat_ndvi("LANDSAT/LC09/C02/T1_L2")
+
+#         sentinel2 = (
+#             ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+#             .filterDate(start_date, end_date)
+#             .filterBounds(geometry)
+#             .map(lambda img: (
+#                 img.select("B.*")
+#                 .multiply(0.0001)
+#                 .normalizedDifference(["B8", "B4"])
+#                 .rename("ndvi")
+#                 .clip(geometry)
+#                 .copyProperties(img, ["system:time_start"])
+#             ))
+#         )
+
+#         ndvi_collection = (
+#             landsat8.merge(landsat9).merge(sentinel2)
+#             .sort("system:time_start")
+#         )
+
+#         # ==================================================
+#         # 3) MONTH LIST STRICTLY FROM DATE RANGE
+#         # ==================================================
+#         start = ee.Date(start_date)
+#         end = ee.Date(end_date)
+
+#         month_count = end.difference(start, "month").add(1)
+
+#         month_starts = ee.List.sequence(0, month_count.subtract(1)).map(
+#             lambda m: start.advance(m, "month")
+#         )
+
+#         # ==================================================
+#         # 4) MONTHLY NDVI (ONLY DATE RANGE)
+#         # ==================================================
+#         def monthly_composite(date):
+#             date = ee.Date(date)
+#             month_start = date
+#             month_end = date.advance(1, "month")
+
+#             col = ndvi_collection.filterDate(month_start, month_end)
+
+#             img = ee.Image(
+#                 ee.Algorithms.If(
+#                     col.size().gt(0),
+#                     col.median(),
+#                     ee.Image.constant(0).rename("ndvi").updateMask(ee.Image(0))
+#                 )
+#             ).clip(geometry)
+
+#             return img.set({
+#                 "system:time_start": month_start.millis(),
+#                 "system:index": month_start.format("YYYY-MM")
+#             })
+
+#         monthly_ndvi = ee.ImageCollection(month_starts.map(monthly_composite))
+
+#         # ==================================================
+#         # 5) NDVI AREA (HECTARES)
+#         # ==================================================
+#         def area_calc(img):
+#             veg_mask = img.select("ndvi").gte(ndvi_threshold)
+
+#             area = (
+#                 ee.Image.pixelArea()
+#                 .divide(10000)
+#                 .updateMask(veg_mask)
+#                 .reduceRegion(
+#                     reducer=ee.Reducer.sum(),
+#                     geometry=geometry,
+#                     scale=30,
+#                     maxPixels=1e13
+#                 )
+#                 .get("area")
+#             )
+
+#             return ee.Feature(None, {
+#                 "month": ee.Date(img.get("system:time_start")).format("YYYY-MM"),
+#                 "ndvi_threshold": ndvi_threshold,
+#                 "area_ha": area
+#             })
+
+#         ndvi_area_fc = ee.FeatureCollection(monthly_ndvi.map(area_calc))
+
+#         # ==================================================
+#         # 6) TILE (MEAN OF RANGE ONLY)
+#         # ==================================================
+#         sugarcane_mask = monthly_ndvi.mean().gte(ndvi_threshold).selfMask()
+# # --- RGB BASE (Sentinel-2 True Color) ---
+#         rgb_base = (
+#             ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+#             .filterDate(start_date, end_date)
+#             .filterBounds(geometry)
+#             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
+#             .median()
+#             .clip(geometry)
+#         )
+
+#         # rgb_vis = rgb_base.visualize(
+#         #     bands=["B4", "B3", "B2"],  # True color
+#         #     min=0,
+#         #     max=3000
+#         # )
+#         # --- Black background ---
+#         black_bg = ee.Image.constant(0).clip(geometry).visualize(
+#                 min=0,
+#                 max=1,
+#                 palette=["000000"]
+#             )
+
+#         # --- Sugarcane Overlay (GREEN ONLY) ---
+#         sugarcane_vis = sugarcane_mask.visualize(
+#             palette=["00FF00"]
+#         )
+
+#         # --- Blend RGB + Sugarcane ---
+#         final_viz = black_bg.blend(sugarcane_vis)
+
+#         tile_url = final_viz.getMapId()["tile_fetcher"].url_format
+
+#         # ==================================================
+#         # 7) RESPONSE
+#         # ==================================================
+#         return {
+#             "type": "FeatureCollection",
+#             "features": [{
+#                 "type": "Feature",
+#                 "geometry": response_geometry,
+#                 "properties": {
+#                     "plot_id": plot_name,
+#                     "tile_url": tile_url,
+#                     "data_source": "Landsat 8/9 + Sentinel-2 NDVI",
+#                     "start_date": start_date,
+#                     "end_date": end_date,
+#                     "ndvi_threshold": ndvi_threshold,
+#                     "last_updated": datetime.now().isoformat(),
+#                 }
+#             }],
+#             "ndvi_area_summary": ndvi_area_fc.getInfo()
+#         }
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(500, f"NDVI detection failed: {e}")
 @app.post("/ndvi-sugarcane-detection")
 async def ndvi_sugarcane_detection(
     district: str = Query(...),
@@ -2968,7 +3214,7 @@ async def ndvi_sugarcane_detection(
 ):
     try:
         # ==================================================
-        # 1) GEOMETRY SELECTION (UNCHANGED)
+        # 1) GEOMETRY SELECTION
         # ==================================================
         geometry = None
         response_geometry = None
@@ -3072,32 +3318,22 @@ async def ndvi_sugarcane_detection(
             ))
         )
 
-        ndvi_collection = (
-            landsat8.merge(landsat9).merge(sentinel2)
-            .sort("system:time_start")
-        )
+        ndvi_collection = landsat8.merge(landsat9).merge(sentinel2)
 
         # ==================================================
-        # 3) MONTH LIST STRICTLY FROM DATE RANGE
+        # 3) MONTHLY NDVI
         # ==================================================
         start = ee.Date(start_date)
         end = ee.Date(end_date)
 
         month_count = end.difference(start, "month").add(1)
-
         month_starts = ee.List.sequence(0, month_count.subtract(1)).map(
             lambda m: start.advance(m, "month")
         )
 
-        # ==================================================
-        # 4) MONTHLY NDVI (ONLY DATE RANGE)
-        # ==================================================
         def monthly_composite(date):
             date = ee.Date(date)
-            month_start = date
-            month_end = date.advance(1, "month")
-
-            col = ndvi_collection.filterDate(month_start, month_end)
+            col = ndvi_collection.filterDate(date, date.advance(1, "month"))
 
             img = ee.Image(
                 ee.Algorithms.If(
@@ -3107,23 +3343,19 @@ async def ndvi_sugarcane_detection(
                 )
             ).clip(geometry)
 
-            return img.set({
-                "system:time_start": month_start.millis(),
-                "system:index": month_start.format("YYYY-MM")
-            })
+            return img.set("system:time_start", date.millis())
 
         monthly_ndvi = ee.ImageCollection(month_starts.map(monthly_composite))
 
         # ==================================================
-        # 5) NDVI AREA (HECTARES)
+        # 4) NDVI AREA CALCULATION
         # ==================================================
         def area_calc(img):
-            veg_mask = img.select("ndvi").gte(ndvi_threshold)
-
+            mask = img.gte(ndvi_threshold)
             area = (
                 ee.Image.pixelArea()
                 .divide(10000)
-                .updateMask(veg_mask)
+                .updateMask(mask)
                 .reduceRegion(
                     reducer=ee.Reducer.sum(),
                     geometry=geometry,
@@ -3135,47 +3367,62 @@ async def ndvi_sugarcane_detection(
 
             return ee.Feature(None, {
                 "month": ee.Date(img.get("system:time_start")).format("YYYY-MM"),
-                "ndvi_threshold": ndvi_threshold,
                 "area_ha": area
             })
 
         ndvi_area_fc = ee.FeatureCollection(monthly_ndvi.map(area_calc))
 
         # ==================================================
-        # 6) TILE (MEAN OF RANGE ONLY)
+        # 5) FINAL TILE IMAGE (VISUAL)
         # ==================================================
         sugarcane_mask = monthly_ndvi.mean().gte(ndvi_threshold).selfMask()
-# --- RGB BASE (Sentinel-2 True Color) ---
-        rgb_base = (
-            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-            .filterDate(start_date, end_date)
-            .filterBounds(geometry)
-            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
-            .median()
-            .clip(geometry)
+
+        black_bg = ee.Image.constant(0).clip(geometry).visualize(
+            min=0,
+            max=1,
+            palette=["000000"]
         )
 
-        # rgb_vis = rgb_base.visualize(
-        #     bands=["B4", "B3", "B2"],  # True color
-        #     min=0,
-        #     max=3000
-        # )
-        # --- Black background ---
-        black_bg = ee.Image.constant(0).clip(geometry).visualize(
-                min=0,
-                max=1,
-                palette=["000000"]
-            )
-
-        # --- Sugarcane Overlay (GREEN ONLY) ---
         sugarcane_vis = sugarcane_mask.visualize(
             palette=["00FF00"]
         )
 
-        # --- Blend RGB + Sugarcane ---
-        final_viz = black_bg.blend(sugarcane_vis)
+        boundary = (
+            ee.Image()
+            .byte()
+            .paint(
+                featureCollection=ee.FeatureCollection([ee.Feature(geometry)]),
+                color=1,
+                width=2
+            )
+            .visualize(palette=["FFFFFF"])
+        )
+
+        final_viz = (
+            black_bg
+            .blend(sugarcane_vis)
+            .blend(boundary)
+        )
 
         tile_url = final_viz.getMapId()["tile_fetcher"].url_format
+
+        # ==================================================
+        # 6) EXPORT GEO-TIFF TO GOOGLE DRIVE
+        # ==================================================
+        export_name = f"{plot_name}_{start_date}_{end_date}"
+
+        task = ee.batch.Export.image.toDrive(
+            image=final_viz,
+            description=export_name,
+            folder="sugarcane_ndvi_exports",
+            fileNamePrefix=export_name,
+            region=geometry,
+            scale=30,
+            maxPixels=1e13,
+            fileFormat="GEO_TIFF"
+        )
+
+        task.start()
 
         # ==================================================
         # 7) RESPONSE
@@ -3192,6 +3439,13 @@ async def ndvi_sugarcane_detection(
                     "start_date": start_date,
                     "end_date": end_date,
                     "ndvi_threshold": ndvi_threshold,
+                    "drive_export": {
+                        "status": "STARTED",
+                        "folder": "sugarcane_ndvi_exports",
+                        "file_prefix": export_name,
+                        "file_format": "GEO_TIFF",
+                        "ee_account_note": "Exported to the same Google Drive account used for Earth Engine initialization"
+                    },
                     "last_updated": datetime.now().isoformat(),
                 }
             }],
@@ -3202,146 +3456,192 @@ async def ndvi_sugarcane_detection(
         raise
     except Exception as e:
         raise HTTPException(500, f"NDVI detection failed: {e}")
-@app.get("/ndvi-sugarcane-png")
-def download_ndvi_sugarcane_png(
-    district: str,
-    subdistrict: str | None = None,
-    village: str | None = None,
+
+@app.post("/methane-concentration")
+async def methane_concentration(
+    district: str = Query(...),
+    subdistrict: str | None = Query(None),
+    village: str | None = Query(None),
     start_date: str = Query(...),
     end_date: str = Query(...),
-    ndvi_threshold: float = Query(0.6),
-    z: int = Query(...),
-    x: int = Query(...),
-    y: int = Query(...),
     db: Session = Depends(get_db),
 ):
-    """
-    Downloads a single PNG tile for NDVI sugarcane detection
-    using the SAME inputs as /ndvi-sugarcane-detection
-    """
-
     try:
-        # ----------------------------------------------
-        # 1) CALL EXISTING DETECTION LOGIC
-        # ----------------------------------------------
-        result = ndvi_sugarcane_detection(
-            district=district,
-            subdistrict=subdistrict,
-            village=village,
-            start_date=start_date,
-            end_date=end_date,
-            ndvi_threshold=ndvi_threshold,
-            db=db,
+        # ==================================================
+        # 1) GEOMETRY SELECTION
+        # ==================================================
+        geometry = None
+        response_geometry = None
+        plot_name = None
+
+        if district and not subdistrict and not village:
+            row = db.execute(
+                text("""
+                    SELECT district_name,
+                           ST_AsGeoJSON(geom)::json AS geometry
+                    FROM districts
+                    WHERE LOWER(district_name) = LOWER(:district)
+                    LIMIT 1
+                """),
+                {"district": district},
+            ).mappings().first()
+            if not row:
+                raise HTTPException(404, "District not found")
+
+            plot_name = row["district_name"]
+            geometry = ee.Geometry(row["geometry"])
+            response_geometry = row["geometry"]
+
+        elif district and subdistrict and not village:
+            row = db.execute(
+                text("""
+                    SELECT v.sub_dist,
+                           ST_AsGeoJSON(ST_Union(b.geom))::json AS geometry
+                    FROM village v
+                    JOIN village_boundaries b ON b.village_id = v.id
+                    WHERE LOWER(v.district) = LOWER(:district)
+                      AND LOWER(v.sub_dist) = LOWER(:subdistrict)
+                    GROUP BY v.sub_dist
+                """),
+                {"district": district, "subdistrict": subdistrict},
+            ).mappings().first()
+            if not row:
+                raise HTTPException(404, "Subdistrict not found")
+
+            plot_name = row["sub_dist"]
+            geometry = ee.Geometry(row["geometry"])
+            response_geometry = row["geometry"]
+
+        elif district and subdistrict and village:
+            row = db.execute(
+                text("""
+                    SELECT v.village_name,
+                           ST_AsGeoJSON(b.geom)::json AS geometry
+                    FROM village v
+                    JOIN village_boundaries b ON b.village_id = v.id
+                    WHERE LOWER(v.district) = LOWER(:district)
+                      AND LOWER(v.sub_dist) = LOWER(:subdistrict)
+                      AND LOWER(v.village_name) = LOWER(:village)
+                    LIMIT 1
+                """),
+                {"district": district, "subdistrict": subdistrict, "village": village},
+            ).mappings().first()
+            if not row:
+                raise HTTPException(404, "Village not found")
+
+            plot_name = row["village_name"]
+            geometry = ee.Geometry(row["geometry"])
+            response_geometry = row["geometry"]
+
+        else:
+            raise HTTPException(400, "Invalid input combination")
+
+        # ==================================================
+        # 2) SENTINEL-5P CH4 COLLECTION (FIXED)
+        # ==================================================
+        ch4_collection = (
+            ee.ImageCollection("COPERNICUS/S5P/OFFL/L3_CH4")
+            .select("CH4_column_volume_mixing_ratio_dry_air")
+            .filterBounds(geometry)
+            .filterDate(start_date, end_date)
+            .map(lambda img: (
+                img.rename("CH4")
+                   .clip(geometry)
+                   .copyProperties(img, ["system:time_start"])
+            ))
         )
 
-        tile_url = result["features"][0]["properties"]["tile_url"]
+        # ==================================================
+        # 3) LAST 12 MONTHS TIME SERIES
+        # ==================================================
+        end = ee.Date(end_date)
+        start = end.advance(-11, "month")
 
-        # ----------------------------------------------
-        # 2) BUILD TILE PNG URL
-        # ----------------------------------------------
-        png_url = (
-            tile_url
-            .replace("{z}", str(z))
-            .replace("{x}", str(x))
-            .replace("{y}", str(y))
+        months = ee.List.sequence(0, 11).map(
+            lambda m: start.advance(m, "month")
         )
 
-        # ----------------------------------------------
-        # 3) FETCH TILE FROM EARTH ENGINE
-        # ----------------------------------------------
-        r = requests.get(png_url, timeout=30)
-        if r.status_code != 200:
-            raise HTTPException(400, "Failed to fetch tile from Earth Engine")
+        def monthly_ch4(date):
+            date = ee.Date(date)
+            col = ch4_collection.filterDate(date, date.advance(1, "month"))
 
-        # ----------------------------------------------
-        # 4) RETURN PNG
-        # ----------------------------------------------
-        filename = f"sugarcane_{district}_{start_date}_{z}_{x}_{y}.png"
+            img = ee.Image(
+                ee.Algorithms.If(
+                    col.size().gt(0),
+                    col.mean(),
+                    ee.Image.constant(0).rename("CH4").updateMask(ee.Image(0))
+                )
+            )
 
-        return StreamingResponse(
-            BytesIO(r.content),
-            media_type="image/png",
-            headers={
-                "Content-Disposition": f"attachment; filename={filename}"
-            }
+            mean_val = img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=geometry,
+                scale=10000,
+                maxPixels=1e13
+            ).get("CH4")
+
+            return ee.Feature(None, {
+                "month": date.format("YYYY-MM"),
+                "mean_ch4_ppb": mean_val
+            })
+
+        ch4_timeseries_fc = ee.FeatureCollection(months.map(monthly_ch4))
+
+        # ==================================================
+        # 4) TILE VISUALIZATION
+        # ==================================================
+        ch4_mean = ch4_collection.mean().clip(geometry)
+
+        ch4_vis = {
+            "min": 1750,
+            "max": 1900,
+            "palette": [
+                "000000", "0000FF", "800080",
+                "00FFFF", "00FF00", "FFFF00", "FF0000"
+            ]
+        }
+
+        ch4_viz = ch4_mean.visualize(**ch4_vis)
+
+        boundary = (
+            ee.Image()
+            .byte()
+            .paint(
+                featureCollection=ee.FeatureCollection([ee.Feature(geometry)]),
+                color=1,
+                width=2
+            )
+            .visualize(palette=["FFFFFF"])
         )
+
+        final_viz = ch4_viz.blend(boundary)
+        tile_url = final_viz.getMapId()["tile_fetcher"].url_format
+
+        # ==================================================
+        # 5) RESPONSE
+        # ==================================================
+        return {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": response_geometry,
+                "properties": {
+                    "plot_id": plot_name,
+                    "tile_url": tile_url,
+                    "data_source": "Sentinel-5P OFFL L3 CH₄",
+                    "unit": "ppb",
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "last_updated": datetime.now().isoformat(),
+                }
+            }],
+            "ch4_monthly_timeseries": ch4_timeseries_fc.getInfo()
+        }
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"PNG download failed: {e}")
-
-@app.get("/ndvi-sugarcane-png")
-def download_ndvi_sugarcane_png(
-    district: str,
-    subdistrict: str | None = None,
-    village: str | None = None,
-    start_date: str = Query(...),
-    end_date: str = Query(...),
-    ndvi_threshold: float = Query(0.6),
-    scale: int = Query(10),  # meters per pixel
-    db: Session = Depends(get_db),
-):
-    try:
-        # 1) Geometry
-        row = db.execute(text("""
-            SELECT ST_AsGeoJSON(geom)::json AS geometry
-            FROM districts
-            WHERE LOWER(district_name)=LOWER(:d)
-            LIMIT 1
-        """), {"d": district}).mappings().first()
-
-        if not row:
-            raise HTTPException(404, "Area not found")
-
-        geometry = ee.Geometry(row["geometry"])
-
-        # 2) NDVI
-        ndvi = (
-            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-            .filterDate(start_date, end_date)
-            .filterBounds(geometry)
-            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
-            .map(lambda img:
-                img.normalizedDifference(["B8", "B4"])
-                   .rename("ndvi")
-                   .clip(geometry)
-            )
-            .mean()
-        )
-
-        sugarcane = ndvi.gte(ndvi_threshold).selfMask()
-
-        # 3) Visualization
-        final_image = (
-            ee.Image.constant(0)
-            .clip(geometry)
-            .visualize(palette=["000000"])
-            .blend(sugarcane.visualize(palette=["00FF00"]))
-        )
-
-        # 4) PNG export (NO XYZ)
-        thumb_url = final_image.getThumbURL({
-            "region": geometry,
-            "scale": scale,
-            "format": "png"
-        })
-
-        r = requests.get(thumb_url, timeout=60)
-        if r.status_code != 200:
-            raise HTTPException(500, "Failed to fetch PNG")
-
-        return StreamingResponse(
-            BytesIO(r.content),
-            media_type="image/png",
-            headers={
-                "Content-Disposition":
-                f"attachment; filename=sugarcane_{district}.png"
-            }
-        )
-
-    except Exception as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, f"Methane processing failed: {e}")
 
 # ============================================
 # MAIN
